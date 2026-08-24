@@ -1,0 +1,8 @@
+{
+  "diagnostic": {
+    "disable_hotkeys": false,
+    "disable_voice": false,
+    "disable_eq": false,
+    "disable_tray": false
+  }
+}
