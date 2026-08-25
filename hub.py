@@ -322,6 +322,15 @@ class Hub:
             ordered = sort_windows_by_rules(items, preset.get("rules", []))
             for i, item in enumerate(ordered):
                 item["target_index"] = i
+            # 排序诊断 (2026-08-25): 记录每组 app 串 + 重复检测 — 定位 order mismatch
+            procs = [x.get("process", "") for x in ordered]
+            dups = sorted({p for p in procs if procs.count(p) > 1})
+            if dups:
+                log.warning("排序诊断: 重复 app 串=%s (身份匹配歧义 → 疑似 order mismatch 根因)",
+                            dups)
+            log.info("排序诊断: %d 组, 目标序=%s", len(ordered),
+                     [f"{x.get('process','?')}#{x.get('current_index','?')}->{i}"
+                      for i, x in enumerate(ordered)])
             result = mgr.sort(ordered)
             msg = result.get("message") or result.get("error") or "?"
             if result.get("success"):
@@ -367,9 +376,9 @@ class Hub:
             self.tray.notify(f"Slot {slot} empty — nothing to restore")
             log.info("恢复槽 %d 为空,跳过", slot)
             return
-        ok = windows.restore_slot(data["windows"])
+        ok, matches = windows.restore_slot(data["windows"])
         log.info("恢复槽 %d ok=%d/%d", slot, ok, len(data["windows"]))
-        windows.bring_foreground(data["windows"], data["foreground_pid"])
+        windows.bring_foreground(data["windows"], data["foreground_pid"], matches)
         self.tray.notify(f"Slot {slot} restored ({ok}/{len(data['windows'])} windows)")
         self.preview.refresh_slots()
 

@@ -1,6 +1,8 @@
 """窗口采集/恢复 — zorder snapshot.cpp/restore.cpp 的 Python 移植 (win32gui)。
 
-采集顺序 = EnumWindows z-order 顶→底; 恢复 = 逆序置 TOPMOST 再解除, 还原快照顺序。
+采集顺序 = EnumWindows z-order 顶→底 (列表顺序即 z-order, 快照天然记录精确顺序)。
+恢复 = 逆序 HWND_TOP 逐个置到非置顶带顶, 最终顶序与快照一致;
+匹配 = build_matches 两阶段合一分配 (2026-08-25 修复多窗口应用顺序随机, 见函数 docstring)。
 """
 import os
 import win32con
@@ -37,6 +39,15 @@ class WinRecord:
     top: int
     width: int
     height: int
+
+
+@dataclass
+class Candidate:
+    """恢复时的候选顶层窗口 (当前 z-order 序), build_matches 的输入。"""
+    hwnd: int
+    pid: int
+    cls: str
+    title: str
 
 
 def is_excluded_class(cls):
@@ -115,59 +126,75 @@ def capture_windows():
     return out
 
 
-def record_matches(rec, pid, cls, title):
-    return rec.pid == pid and rec.cls == cls and rec.title == title
+def capture_candidates():
+    """当前所有顶层窗口候选 (z-order 顶→底): hwnd/pid/cls/title。
 
-
-def find_window_by_pid(pid, cls, title):
-    """精确匹配 pid+cls+title 的窗口; 无则 None。回调绝不抛出 (UIPI 保护窗口跳过)。"""
-    result = [None]
-
-    def cb(h, _lp):
-        if result[0] is not None:
-            return False
-        if _win_pid(h) != pid:
-            return True
-        if _win_class(h) != cls:
-            return True
-        if _win_title(h) != title:
-            return True
-        result[0] = h
-        return False
-
-    try:
-        win32gui.EnumWindows(cb, 0)
-    except Exception:
-        pass
-    return result[0]
-
-
-def find_window_by_pid_class(pid, cls):
-    """降级匹配: 同 pid+同 class 恰好一个时返回, 多个返回 None (无法安全判定)。"""
-    found = []
+    与 capture_windows 不同: 不过滤可见/标题/置顶 —— 恢复需匹配到快照中此刻
+    最小化/标题已变的窗口。仅跳过读不到 pid/class 的保护窗口 (UIPI)。
+    """
+    out = []
 
     def cb(h, _lp):
-        if _win_pid(h) == pid and _win_class(h) == cls:
-            found.append(h)
+        try:
+            pid = _win_pid(h)
+            if not pid:
+                return True
+            cls = _win_class(h)
+            if not cls:
+                return True
+            out.append(Candidate(h, pid, cls, _win_title(h)))
+        except Exception:
+            pass  # 受保护窗口: 跳过, 绝不中断枚举
         return True
 
-    try:
-        win32gui.EnumWindows(cb, 0)
-    except Exception:
-        pass
-    return found[0] if len(found) == 1 else None
+    win32gui.EnumWindows(cb, 0)
+    return out
 
 
-def match_window(rec):
-    """两级匹配: 精确 pid+cls+title → 降级 pid+cls (标题变化兜底)。"""
-    h = find_window_by_pid(rec.pid, rec.cls, rec.title)
-    if not h:
-        h = find_window_by_pid_class(rec.pid, rec.cls)
-    return h
+def build_matches(records, candidates):
+    """按快照顺序 (顶→底) 为每条记录分配合一 HWND, 返回 [hwnd|None]。
+
+    两阶段合一分配 (2026-08-25 修复恢复顺序随机):
+      ① 精确 (pid+cls+title) 匹配先行 —— 标题作为窗口身份, 标题交换/变化也锚定正确窗口
+      ② 未匹配记录回退同 (pid+cls) 首个未分配候选 (按当前 z-order 顶→底优先)
+    每个候选 HWND 至多分配一次 → 同应用多窗口 / 同标题 / 标题变化全部确定性还原。
+
+    弃用旧 find_window_by_pid 的首个匹配: 两张同标题窗口间歧义 → 恢复顺序随机;
+    旧 find_window_by_pid_class 在 >=2 个同 pid+cls 窗口时全部跳过。
+    """
+    assigned = set()
+    matches = [None] * len(records)
+
+    # 阶段 ①: 精确标题匹配 (身份锚定)
+    for i, rec in enumerate(records):
+        for c in candidates:
+            if c.hwnd in assigned:
+                continue
+            if c.pid == rec.pid and c.cls == rec.cls and c.title == rec.title:
+                matches[i] = c.hwnd
+                assigned.add(c.hwnd)
+                break
+
+    # 阶段 ②: 未匹配记录回退同 pid+cls (当前 z-order 顶→底)
+    for i, rec in enumerate(records):
+        if matches[i] is not None:
+            continue
+        for c in candidates:
+            if c.hwnd in assigned:
+                continue
+            if c.pid == rec.pid and c.cls == rec.cls:
+                matches[i] = c.hwnd
+                assigned.add(c.hwnd)
+                break
+    return matches
 
 
 def restore_slot(windows):
-    """恢复快照窗口几何+顺序, 返回成功恢复数。
+    """恢复快照窗口几何+顺序, 返回 (成功数, matches)。
+
+    matches = build_matches (当前 z-order 候选, 两阶段合一分配) —— 修复同应用
+    多窗口 (同 pid+cls) 恢复顺序随机 (2026-08-25)。matches 顺序 = 快照顺序,
+    bring_foreground 复用, 避免二次匹配歧义。
 
     文件顺序 z-order 顶→底, 逆序 HWND_TOP 处理: 底→顶逐个置到非置顶带顶,
     最终顶序与快照一致。
@@ -178,14 +205,14 @@ def restore_slot(windows):
     不受影响 (其 33ms tick 自愈检测也能正常工作)。
     位置/尺寸未变的窗口跳过 SetWindowPos, 减少逐个闪烁与叠加层重锚抖动。
     """
+    matches = build_matches(windows, capture_candidates())
     ok = 0
-    for rec in reversed(windows):
+    for rec, h in zip(reversed(windows), reversed(matches)):
+        if h is None:
+            continue
         try:
             if _is_excluded_exe(rec.exe):
                 # 旧快照可能含常驻系统窗 (TextInputHost): 跳过, 不参与恢复
-                continue
-            h = match_window(rec)
-            if not h:
                 continue
             # 最小化窗口先还原 (最小化窗口无位置, SetWindowPos 位置参数会被忽略)。
             # 用 SW_SHOWNOACTIVATE 而非 SW_RESTORE: SW_RESTORE 会激活窗口 → 抬到最上层并
@@ -204,31 +231,28 @@ def restore_slot(windows):
         except Exception:
             # 单个窗口失败绝不中断整体恢复 (窗口中途销毁/受保护等)
             continue
-    # 2026-08-14: 恢复后清扫 — 当前可见但不在快照中的窗口最小化 (窗口越积越多问题)
-    minimize_strays(windows)
-    return ok
+    # 2026-08-14: 恢复后清扫 — 当前可见但不在快照匹配集合中的窗口最小化 (窗口越积越多问题)
+    minimize_strays(set(h for h in matches if h is not None))
+    return ok, matches
 
 
-def minimize_strays(snapshot_windows):
-    """恢复后清扫: 当前可见但不在快照里的窗口 → 最小化。
+def minimize_strays(keep_hwnds):
+    """恢复后清扫: 当前可见但不在 keep_hwnds 里的窗口 → 最小化。
 
     用户需求 (2026-08-14): 目标布局未提到的最小化窗口若正开着, 恢复不会动它,
-    窗口越积越多。区分两类: 该打开的 (快照内, 保留) / 不该打开但已打开的
-    (当前可见且不在快照, 最小化)。
+    窗口越积越多。区分两类: 该打开的 (快照匹配到的 HWND, 保留) / 不该打开但已
+    打开的 (当前可见且不在匹配集合, 最小化)。
 
-    过滤与 capture 同规则 (可见/有标题/非最小化/非置顶/非排除类/非排除 exe),
-    再加: 快照中匹配到的窗口 (含两级匹配) 保留。绝不最小化常驻系统窗
-    (TextInputHost 等) 与自身预览窗。
+    keep_hwnds 直接来自 restore_slot 的 build_matches 结果, 不再二次匹配
+    (旧实现 match_window 与恢复时可能拿到不同窗口, 造成误最小化)。
+
+    过滤与 capture 同规则 (可见/有标题/非最小化/非置顶/非排除类/非排除 exe)。
+    绝不最小化常驻系统窗 (TextInputHost 等) 与自身预览窗。
     """
-    keep = set()
-    for rec in snapshot_windows:
-        h = match_window(rec)
-        if h:
-            keep.add(h)
 
     def cb(h, _lp):
         try:
-            if h in keep:
+            if h in keep_hwnds:
                 return True
             if not win32gui.IsWindowVisible(h):
                 return True
@@ -250,35 +274,39 @@ def minimize_strays(snapshot_windows):
     win32gui.EnumWindows(cb, 0)
 
 
-def bring_foreground(windows, foreground_pid):
-    """快照前台窗口恢复到前台 (绕过前台锁: AttachThreadInput + ShowWindow + SetForegroundWindow)。"""
-    for rec in windows:
-        if rec.pid != foreground_pid:
-            continue
-        h = find_window_by_pid(rec.pid, rec.cls, rec.title)
-        if not h:
-            return False
+def bring_foreground(windows, foreground_pid, matches=None):
+    """快照前台窗口恢复到前台 (绕过前台锁: AttachThreadInput + ShowWindow + SetForegroundWindow)。
+
+    matches 复用 restore_slot 的合一分配 (None 时重建)。只作用于快照顶窗 (记录 0):
+    非顶窗不应被抬到最前, 否则破坏刚恢复的顺序 (快照前台 = 非置顶带顶窗)。
+    """
+    if matches is None:
+        matches = build_matches(windows, capture_candidates())
+    if not windows or not matches or matches[0] is None:
+        return False
+    if windows[0].pid != foreground_pid:
+        return False
+    h = matches[0]
+    try:
+        fg = win32process.GetWindowThreadProcessId(win32gui.GetForegroundWindow())[0]
+    except Exception:
+        fg = 0
+    me = win32api_get_current_thread_id()
+    try:
+        target = win32process.GetWindowThreadProcessId(h)[0]
+        win32process.AttachThreadInput(me, fg, True)
+        win32process.AttachThreadInput(me, target, True)
         try:
-            fg = win32process.GetWindowThreadProcessId(win32gui.GetForegroundWindow())[0]
-        except Exception:
-            fg = 0
-        me = win32api_get_current_thread_id()
-        try:
-            target = win32process.GetWindowThreadProcessId(h)[0]
-            win32process.AttachThreadInput(me, fg, True)
-            win32process.AttachThreadInput(me, target, True)
-            try:
-                if win32gui.IsIconic(h):
-                    win32gui.ShowWindow(h, win32con.SW_RESTORE)
-                win32gui.SetForegroundWindow(h)
-            finally:
-                win32process.AttachThreadInput(me, fg, False)
-                win32process.AttachThreadInput(me, target, False)
-            return True
-        except Exception:
-            # UIPI 拒绝 (error 5) 等: 放弃该窗口的前台恢复, 不中断
-            return False
-    return False
+            if win32gui.IsIconic(h):
+                win32gui.ShowWindow(h, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(h)
+        finally:
+            win32process.AttachThreadInput(me, fg, False)
+            win32process.AttachThreadInput(me, target, False)
+        return True
+    except Exception:
+        # UIPI 拒绝 (error 5) 等: 放弃该窗口的前台恢复, 不中断
+        return False
 
 
 def win32api_get_current_thread_id():
