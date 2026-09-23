@@ -16,6 +16,9 @@
 
 --daemon 模式: 单实例 Mutex (Local\\UtilityHub) + PID 文件 logs/hub.pid,
 退出: uninstall.bat 或 taskkill /f /pid <logs/hub.pid>。
+
+托盘右键 = Qt QMenu 暗夜模式 (sunset 系); EdgeDock 子菜单管理右缘 dock 条
+(隐藏/显示/退出/恢复, 28edge-dock 只读复用, 见 edgedock_host.py)。
 """
 import faulthandler
 import json
@@ -51,8 +54,9 @@ from taskbar_sorter.injector import InjectorManager
 from taskbar_sorter.window_detector import sort_windows_by_rules
 from zorder import audio, slots, windows
 from hotkeys import HotkeyController
+from autosort import TaskbarAutoSort
 from preview import PreviewWindow, preset_summary_lines
-from tray import Tray
+from tray import Tray, NIGHT_QSS, ID_FOCUS_PAUSE, ID_FOCUS_CONFIG, ID_FOCUS_DATA
 
 log = logging.getLogger("hub")
 
@@ -112,6 +116,10 @@ class Hub:
 
     def __init__(self):
         self.app = QApplication(sys.argv)
+        # 暗夜模式 (2026-09-19): 托盘 QMenu + QToolTip 全进程染暗 (sunset 系, 同 28edge-dock)。
+        self.app.setStyleSheet(NIGHT_QSS)
+        # 托盘常驻进程: dock 隐藏/详情窗关闭等"最后一个窗口关闭"不许退进程。
+        self.app.setQuitOnLastWindowClosed(False)
         self.preview = PreviewWindow()
         self.controller = HotkeyController(self, enabled=not _disabled("hotkeys"))
         self.tray = Tray(self, enabled=not _disabled("tray"))
@@ -129,6 +137,105 @@ class Hub:
         # VoiceInput (11cc-voice-input 只读复用, Pause 开关录音)。
         self.vi = None
         self._init_voice()
+        # Focus 专注拦截 (config.ini 规则 + 屏幕使用时间 + 浏览器扩展配套服务)。
+        self.focus = None
+        self._init_focus()
+        # 任务栏彩虹自愈 (explorer 重启后自动恢复排序, 2026-09-15)。
+        self.autosort = None
+        self._init_autosort()
+        # EdgeDock (28edge-dock 只读复用: 右缘 dock 条 + balances 托管于本进程,
+        # 互斥体接管独立 exe, 2026-09-19)。
+        self.edgedock = None
+        self._init_edgedock()
+
+    def _init_focus(self):
+        if _disabled("focus"):
+            log.info("Focus 已禁用 (diagnostic.disable_focus)")
+            return
+        try:
+            from focus.server import FocusServer
+            self.focus = FocusServer()
+            self.focus.start()
+            log.info("Focus 服务已启动: http://127.0.0.1:%s (扩展: focus/extension)", self.focus.port)
+        except BaseException as e:
+            log.warning("Focus 启动失败 (端口占用/配置错误): %s", e)
+            self.focus = None
+
+    # ---------- 任务栏彩虹自愈 ----------
+
+    def _init_autosort(self):
+        if _disabled("autosort"):
+            log.info("任务栏自愈排序已禁用 (diagnostic.disable_autosort)")
+            return
+        try:
+            self.autosort = TaskbarAutoSort(self)
+            self.autosort.start()
+            log.info("任务栏自愈排序已启用: explorer 重启后自动恢复当前预设排序")
+        except BaseException as e:
+            log.warning("任务栏自愈排序启动失败 (功能禁用): %s", e)
+            self.autosort = None
+
+    # ---------- EdgeDock: 挂载/动作 (托盘子菜单直连 edgedock_host) ----------
+
+    def _init_edgedock(self):
+        if _disabled("edgedock"):
+            log.info("EdgeDock 已禁用 (diagnostic.disable_edgedock)")
+            return
+        try:
+            from edgedock_host import EdgeDockHost
+            self.edgedock = EdgeDockHost(self)
+            log.info("EdgeDock 已集成: 右缘 dock 条 + balances 托管于 hub 进程 "
+                     "(独立 exe 由互斥体接管)")
+        except BaseException as e:
+            log.warning("EdgeDock 集成失败 (功能禁用): %s", e)
+            self.edgedock = None
+
+    # ---------- Focus: 托盘 ----------
+
+    def focus_status_lines(self):
+        """Focus 子菜单行: [(文本, cmd_or_0)]; cmd=0 → 灰显信息行。"""
+        if not self.focus:
+            return [("未启用 (diagnostic.disable_focus)", 0)]
+        try:
+            stats = self.focus.handle_stats()
+        except Exception as e:
+            return [(f"服务异常: {e}", 0)]
+        lines = []
+        if stats.get("paused_for", 0) > 0:
+            lines.append((f"⏸ 已暂停 {stats['paused_for'] // 60} 分钟 (自动恢复)", 0))
+        elif stats["in_worktime"]:
+            lines.append(("● 工作时段 · 执法中 (扩展徽章绿灯)", 0))
+        else:
+            lines.append(("○ 非工作时段 · 只记账不拦", 0))
+        if not stats["top"]:
+            lines.append(("今日暂无记录", 0))
+        for t in stats["top"]:
+            mark = "⛔" if t["blocked"] else ""
+            lines.append((f"{t['domain']}  {t['minutes']}分/{t['budget']}分 {mark}", 0))
+        lines.append(("暂停拦截 10 分钟" if stats.get("paused_for", 0) <= 0
+                      else "恢复拦截", ID_FOCUS_PAUSE))
+        lines.append(("打开 config.ini", ID_FOCUS_CONFIG))
+        lines.append(("打开用量数据", ID_FOCUS_DATA))
+        return lines
+
+    def focus_toggle_pause(self):
+        if not self.focus:
+            return
+        if self.focus.paused_until > time.time():
+            self.focus.paused_until = 0.0
+            self.tray.notify("Focus 拦截已恢复")
+        else:
+            self.focus.paused_until = time.time() + 600
+            self.tray.notify("Focus 拦截暂停 10 分钟 (到期自动恢复)")
+
+    def open_focus_config(self):
+        QDesktopServices.openUrl(QUrl.fromLocalFile(
+            os.path.join(ROOT, "focus", "config.ini")))
+
+    def open_focus_data(self):
+        os.makedirs(os.path.join(ROOT, "data", "focus"), exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(
+            os.path.join(ROOT, "data", "focus")))
 
     def _init_voice(self):
         if _disabled("voice"):
@@ -309,37 +416,55 @@ class Hub:
     def sort_now(self):
         self._post(self._sort_once)
 
+    def _sort_core(self):
+        """probe → 规则排序 → 注入执行, 返回 (success, msg)。
+
+        失败自动重试一轮 (2026-09-15): probe→sort 间容器变化 (开/关窗口) 是
+        order mismatch / container changed 的常见根因, 重读容器重算即愈。
+        成功路径行为与原实现一致。
+        """
+        result = {"success": False, "error": "?"}
+        try:
+            for attempt in (1, 2):
+                mgr = InjectorManager()
+                items = mgr.probe().get("items", [])
+                if not items:
+                    raise RuntimeError("探测失败: 没有任务栏分组")
+                preset = ConfigManager().get_active_preset()
+                ordered = sort_windows_by_rules(items, preset.get("rules", []))
+                for i, item in enumerate(ordered):
+                    item["target_index"] = i
+                # 排序诊断 (2026-08-25): 记录每组 app 串 + 重复检测 — 定位 order mismatch
+                procs = [x.get("process", "") for x in ordered]
+                dups = sorted({p for p in procs if procs.count(p) > 1})
+                if dups:
+                    log.warning("排序诊断: 重复 app 串=%s (身份匹配歧义 → 疑似 order mismatch 根因)",
+                                dups)
+                log.info("排序诊断: %d 组, 目标序=%s", len(ordered),
+                         [f"{x.get('process','?')}#{x.get('current_index','?')}->{i}"
+                          for i, x in enumerate(ordered)])
+                result = mgr.sort(ordered)
+                if result.get("success"):
+                    msg = result.get("message") or "ok"
+                    log.info("排序成功: %s", msg)
+                    return True, msg
+                log.warning("排序失败 (第 %d 次): %s", attempt,
+                            result.get("error") or "?")
+            return False, result.get("error") or "?"
+        except Exception as e:
+            log.exception("排序异常: %s", e)
+            return False, str(e)
+
     def _sort_once(self):
         if not self._sort_lock.acquire(blocking=False):
             log.info("上一次排序还在进行,跳过")
             return
         try:
-            mgr = InjectorManager()
-            items = mgr.probe().get("items", [])
-            if not items:
-                raise RuntimeError("探测失败: 没有任务栏分组")
-            preset = ConfigManager().get_active_preset()
-            ordered = sort_windows_by_rules(items, preset.get("rules", []))
-            for i, item in enumerate(ordered):
-                item["target_index"] = i
-            # 排序诊断 (2026-08-25): 记录每组 app 串 + 重复检测 — 定位 order mismatch
-            procs = [x.get("process", "") for x in ordered]
-            dups = sorted({p for p in procs if procs.count(p) > 1})
-            if dups:
-                log.warning("排序诊断: 重复 app 串=%s (身份匹配歧义 → 疑似 order mismatch 根因)",
-                            dups)
-            log.info("排序诊断: %d 组, 目标序=%s", len(ordered),
-                     [f"{x.get('process','?')}#{x.get('current_index','?')}->{i}"
-                      for i, x in enumerate(ordered)])
-            result = mgr.sort(ordered)
-            msg = result.get("message") or result.get("error") or "?"
-            if result.get("success"):
-                log.info("排序成功: %s", msg)
+            ok, msg = self._sort_core()
+            if ok:
                 audio.play_success()
             else:
                 log.error("排序失败: %s", msg)
-        except Exception as e:
-            log.exception("排序异常: %s", e)
         finally:
             self._sort_lock.release()
 
@@ -452,6 +577,21 @@ class Hub:
         except OSError:
             pass
         self._eq_stop.set()
+        if self.edgedock:
+            try:
+                self.edgedock.stop(quiet=True)
+            except Exception:
+                pass
+        if self.autosort:
+            try:
+                self.autosort.stop()
+            except Exception:
+                pass
+        if self.focus:
+            try:
+                self.focus.stop()
+            except Exception:
+                pass
         if self.vi:
             try:
                 self.vi.stop()
@@ -468,6 +608,10 @@ class Hub:
         log.info("Utility Hub %s — 右Alt+,./ 槽位 / 右Alt+; 排序 / 右Alt+' EQ",
                  "daemon" if DAEMON else "console")
         log.info("=" * 50)
+        # 退出溯源 (2026-09-19 故障排查): 死亡时 hub.log 里有无 aboutToQuit 是
+        # 归因关键 — 有 = Qt 正常退出路径 (谁调的 quit 往上查); 无 = taskkill/硬崩
+        self.app.aboutToQuit.connect(
+            lambda: log.info("Qt aboutToQuit — 事件循环退出 (quit()/lastWindowClosed)"))
         self.controller.start()
         self._welcome_toast()
         self.app.exec()

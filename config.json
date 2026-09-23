@@ -3,6 +3,9 @@
     "disable_hotkeys": false,
     "disable_voice": false,
     "disable_eq": false,
-    "disable_tray": false
+    "disable_tray": false,
+    "disable_focus": false,
+    "disable_autosort": false,
+    "disable_edgedock": false
   }
 }

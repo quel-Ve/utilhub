@@ -4,14 +4,18 @@
 与自定义叮咚形成双层音效。原生 Shell_NotifyIconW + NIIF_NOSOUND 静音气泡,
 tooltip 仅 "Utility Hub"。
 
-结构: 隐藏消息窗口 (HWND_MESSAGE) 收 WM_TRAY 回调 → 右键 TrackPopupMenu 原生菜单;
-左键双击 = 快照槽 1 (与 zorder C++ 托盘行为一致)。
+结构: 顶层隐藏窗口收 WM_TRAY 回调 → 右键弹 Qt QMenu（暗夜模式, app 级 NIGHT_QSS;
+原生 TrackPopupMenu 无法着色, 2026-09-19 换 QMenu）; 左键双击 = 快照槽 1
+(与 zorder C++ 托盘行为一致)。图标 + 静音气泡仍走原生 Shell_NotifyIconW。
 """
 import ctypes
 import os
 import struct
 import subprocess
 from ctypes import wintypes
+
+from PyQt6.QtGui import QColor, QCursor, QPalette
+from PyQt6.QtWidgets import QMenu
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -62,22 +66,29 @@ WM_RBUTTONUP, WM_LBUTTONDBLCLK, WM_CONTEXTMENU = 0x205, 0x203, 0x7B
 WM_NULL = 0
 # Explorer 托盘重建时广播此消息 → 收到后重新 NIM_ADD (登录早期启动图标丢失的修复)
 WM_TASKBARCREATED = user32.RegisterWindowMessageW("TaskbarCreated")
-MF_POPUP, MF_STRING, MF_SEPARATOR = 0x10, 0, 0x800
-MF_CHECKED, MF_UNCHECKED, MF_GRAYED = 0x8, 0, 0x1
-MF_BYCOMMAND = 0x400
-TPM_RETURNCMD, TPM_NONOTIFY = 0x100, 0x80
 
-# 菜单项 ID
-ID_SORT = 100
-ID_SNAP1, ID_RESTORE1, ID_CLEAR1 = 101, 111, 121
-ID_EQ_CYCLE, ID_EQ_AUTO = 130, 131
-ID_EQ_PRESET0 = 200  # 预设手动切换: 200 + 索引 (数量动态) — 高位区间, 避免与固定 ID 冲突
-# 曾撞号: 原 132 起, ID_EQ_EDITOR=133 落在预设区间内 → 点"调整面板"误触发 indie 预设+预览窗 (2026-08-16)
-ID_EQ_EDITOR = 133   # 打开 EqualizerAPO Editor (当前预设调整面板)
-ID_AUTOSTART, ID_LOG, ID_EXIT = 140, 141, 142
+# 菜单项命令值: 仅 hub.focus_status_lines() 返回的 cmd 用 (其余菜单项直连回调,
+# 不再有 ID 表 — 原 ID_EQ_PRESET0 动态区间撞号事故见 git 历史)
+ID_FOCUS_PAUSE, ID_FOCUS_CONFIG, ID_FOCUS_DATA = 151, 152, 153
 
 TASK_NAME = "UtilityHub"
 TRAY_CLASS = "HubTrayMsgWindow"
+
+# 暗夜模式 (sunset 系, 同 28edge-dock): 托盘 QMenu + 全进程 QToolTip。
+# app 级样式表 → dock 右键菜单 / 详情窗等所有 QMenu/QToolTip 一并染暗。
+NIGHT_QSS = """
+QToolTip { background-color: #12090d; color: #D9CCD2; border: 1px solid #6E4F5B;
+           padding: 6px 9px; font-size: 12px; }
+QMenu { background-color: #12090d; color: #D9CCD2; border: 1px solid #6E4F5B; }
+QMenu::item { padding: 5px 26px 5px 16px; }
+QMenu::item:selected { background-color: #32222A; }
+QMenu::item:disabled { color: #8A7580; }
+QMenu::separator { height: 1px; background-color: #43262F; margin: 4px 8px; }
+QMenu::indicator { width: 12px; height: 12px; margin-left: 8px;
+                   border: 1px solid #6E4F5B; border-radius: 2px;
+                   background-color: #1A1014; }
+QMenu::indicator:checked { background-color: #C95D81; }
+"""
 
 
 class NOTIFYICONDATAW(ctypes.Structure):
@@ -168,13 +179,17 @@ def _build_icon_in_memory():
 
 
 def _task_exists() -> bool:
+    # ⚠ CREATE_NO_WINDOW: 本函数**每次构建托盘菜单**都要调 (每右键一次)，
+    # 不带此标志 schtasks.exe 会弹一个可见黑框 → 用户每右键托盘闪一次。
     return subprocess.run(["schtasks", "/query", "/tn", TASK_NAME],
-                          capture_output=True).returncode == 0
+                          capture_output=True,
+                          creationflags=subprocess.CREATE_NO_WINDOW).returncode == 0
 
 
 def _task_set(on: bool) -> bool:
     if on:
-        py = subprocess.run(["where", "python"], capture_output=True, text=True)
+        py = subprocess.run(["where", "python"], capture_output=True, text=True,
+                            creationflags=subprocess.CREATE_NO_WINDOW)
         if py.returncode != 0:
             return False
         for line in py.stdout.splitlines():
@@ -187,11 +202,13 @@ def _task_set(on: bool) -> bool:
                         ["schtasks", "/create", "/tn", TASK_NAME, "/tr", tr,
                          "/sc", "onlogon", "/ru", os.environ.get("USERNAME", ""),
                          "/rl", "highest", "/f"],
-                        capture_output=True)
+                        capture_output=True,
+                        creationflags=subprocess.CREATE_NO_WINDOW)
                     return r.returncode == 0
         return False
     return subprocess.run(["schtasks", "/delete", "/tn", TASK_NAME, "/f"],
-                          capture_output=True).returncode == 0
+                          capture_output=True,
+                          creationflags=subprocess.CREATE_NO_WINDOW).returncode == 0
 
 
 class Tray:
@@ -200,6 +217,7 @@ class Tray:
         self._nid = None
         self._hwnd = None
         self._wndproc_ref = None  # 防 GC
+        self._menu_ref = None     # popup() 非模态菜单的存活引用 (防 GC 提前销毁)
         if enabled:
             self._create_window()
             self._add_icon()
@@ -215,9 +233,13 @@ class Tray:
         wc.hInstance = kernel32.GetModuleHandleW(None)
         wc.lpszClassName = TRAY_CLASS
         user32.RegisterClassExW(ctypes.byref(wc))
-        self._hwnd = user32.CreateWindowExW(0, TRAY_CLASS, None, 0,
-                                            0, 0, 0, 0, wintypes.HWND(-3),
-                                            None, wc.hInstance, None)
+        # 顶层隐藏窗口（非 HWND_MESSAGE）：TaskbarCreated 经 HWND_BROADCAST 只广播
+        # 到顶层窗口，消息专用窗口 "does not receive broadcast messages" → explorer
+        # 重启后重挂图标逻辑从未触发，托盘图标消失 (2026-08-25 修复)。
+        # WS_EX_TOOLWINDOW(0x80)：隐藏窗口不进任务栏/Alt-Tab；无父窗口 + 无 WS_VISIBLE。
+        self._hwnd = user32.CreateWindowExW(
+            0x80, TRAY_CLASS, None, 0,
+            0, 0, 0, 0, None, None, wc.hInstance, None)
 
     def _add_icon(self):
         nid = NOTIFYICONDATAW()
@@ -253,7 +275,7 @@ class Tray:
         nid.uTimeout = 2000
         shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
 
-    # ---------- 右键菜单 ----------
+    # ---------- 右键菜单 (Qt QMenu, 暗夜) ----------
 
     def _wndproc(self, hwnd, msg, wp, lp):
         if msg == WM_TRAY:
@@ -266,82 +288,150 @@ class Tray:
                 return 0
         if msg == WM_TASKBARCREATED:
             self._add_icon()  # 托盘重建 (登录早期/Explorer 重启) 后重挂图标
+            # explorer 重启 → 任务栏彩虹自愈 (autosort 内部有节流+独立线程, 不阻塞 wndproc)
+            autosort = getattr(self.hub, "autosort", None)
+            if autosort:
+                autosort.notify_shell_restart()
             return 0
         if msg == WM_NULL:
             return 0
         return user32.DefWindowProcW(hwnd, msg, wp, lp)
 
-    def _append_slots(self, menu, base_id, label):
-        sub = user32.CreatePopupMenu()
+    _FOCUS_ACTIONS = {ID_FOCUS_PAUSE: "focus_toggle_pause",
+                      ID_FOCUS_CONFIG: "open_focus_config",
+                      ID_FOCUS_DATA: "open_focus_data"}
+
+    def _build_menu(self) -> QMenu:
+        """托盘右键菜单, 每次右键现建 — EQ 勾选/EdgeDock 运行态自然最新。
+
+        暗色由 app 级 NIGHT_QSS 接管; palette 补齐是给子菜单箭头等 QSS 没盖到的
+        style 元素用 (QPalette 文字色暗掉, 箭头才不隐身)。
+        """
+        h = self.hub
+        menu = QMenu()
+        pal = menu.palette()
+        pal.setColor(QPalette.ColorRole.Window, QColor("#12090d"))
+        pal.setColor(QPalette.ColorRole.WindowText, QColor("#D9CCD2"))
+        pal.setColor(QPalette.ColorRole.Text, QColor("#D9CCD2"))
+        pal.setColor(QPalette.ColorRole.Highlight, QColor("#32222A"))
+        pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#E8C7D4"))
+        pal.setColor(QPalette.ColorRole.ButtonText, QColor("#D9CCD2"))
+        menu.setPalette(pal)
+
+        act = menu.addAction("任务栏排序 (右Alt+;)")
+        act.triggered.connect(h.sort_now)
+        menu.addSeparator()
+        self._add_slot_menu(menu, "快照 Snapshot (右Alt 长按 ,./)", h.snapshot)
+        self._add_slot_menu(menu, "恢复 Restore (右Alt 短按 ,./)", h.restore)
+        self._add_slot_menu(menu, "清空 Clear", h.clear)
+        menu.addSeparator()
+        # EQ 平铺 (无子菜单): 预设项带勾选 + 内联设置摘要 (摘要即原生 tooltip 替代)
+        current = h.eq_current()
+        act = menu.addAction("循环预设 (右Alt+')")
+        act.triggered.connect(h.eq_cycle)
+        for name in h.eq_presets():
+            summary = h.eq_preset_summary(name)
+            label = f"{name}  · {summary}" if summary else name
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(name == current)
+            act.triggered.connect(lambda checked=False, n=name: h.eq_set_preset(n))
+        act = menu.addAction("自动切换")
+        act.setCheckable(True)
+        act.setChecked(h.eq_auto_enabled())
+        act.triggered.connect(lambda checked: h.eq_set_auto(checked))
+        act = menu.addAction("打开调整面板 (EqualizerAPO Editor)")
+        act.triggered.connect(h.open_eq_editor)
+        cur_sum = h.eq_preset_summary(current)
+        info = menu.addAction(f"当前: {current}  · {cur_sum}" if cur_sum
+                              else f"当前: {current}")
+        info.setEnabled(False)
+        menu.addSeparator()
+        self._append_edgedock(menu)
+        menu.addSeparator()
+        self._append_focus(menu)
+        menu.addSeparator()
+        act = menu.addAction("开机自启 (计划任务)")
+        act.setCheckable(True)
+        act.setChecked(_task_exists())
+        act.triggered.connect(self._toggle_autostart)
+        act = menu.addAction("打开日志目录")
+        act.triggered.connect(h.open_log_dir)
+        act = menu.addAction("退出")
+        act.triggered.connect(h.quit)
+        return menu
+
+    def _add_slot_menu(self, menu, label, fn):
+        sub = menu.addMenu(label)
         for i in range(1, 4):
-            user32.AppendMenuW(sub, MF_STRING, base_id + i - 1, f"Slot {i}")
-        user32.AppendMenuW(menu, MF_POPUP, sub, label)
-        return sub
+            act = sub.addAction(f"Slot {i}")
+            act.triggered.connect(lambda checked=False, s=i: fn(s))
+
+    def _append_edgedock(self, menu):
+        """EdgeDock 子菜单: 隐藏/显示、退出/启动(恢复)、刷新、详情、游戏模式。"""
+        sub = menu.addMenu("EdgeDock (右缘)")
+        ed = getattr(self.hub, "edgedock", None)
+        if ed is None:
+            act = sub.addAction("未启用 (diagnostic.disable_edgedock)")
+            act.setEnabled(False)
+            return
+        if not ed.running():
+            act = sub.addAction("启动 EdgeDock (恢复)")
+            act.triggered.connect(ed.start)
+            return
+        act = sub.addAction("隐藏 dock" if not ed.is_hidden() else "显示 dock")
+        act.triggered.connect(lambda: ed.set_hidden(not ed.is_hidden()))
+        act = sub.addAction("立即刷新")
+        act.triggered.connect(ed.refresh)
+        act = sub.addAction("详情窗口")
+        act.triggered.connect(ed.show_detail)
+        act = sub.addAction("游戏模式（隐藏 dock）")
+        act.setCheckable(True)
+        act.setChecked(ed.game_mode())
+        act.triggered.connect(lambda checked: ed.set_game_mode(checked))
+        act = sub.addAction("边缘模式（无 hand，右缘悬停 1.2s 弹出）")
+        act.setCheckable(True)
+        act.setChecked(ed.form() == "edge")
+        act.triggered.connect(lambda checked: ed.set_form("edge" if checked else "hand"))
+        if ed.snaps:
+            sub.addSeparator()
+            head = sub.addAction(ed.status_line())
+            head.setEnabled(False)
+            from edgedock.tray import _row_text  # 局部 import: tray 不强依赖 edgedock
+            for s in ed.snaps:
+                row = sub.addAction(_row_text(s))
+                row.setEnabled(False)
+        sub.addSeparator()
+        act = sub.addAction("退出 EdgeDock")
+        act.triggered.connect(ed.stop)
+
+    def _append_focus(self, menu):
+        sub = menu.addMenu("专注 Focus")
+        for label, cmd in self.hub.focus_status_lines():
+            act = sub.addAction(label)
+            if cmd:
+                act.triggered.connect(getattr(self.hub, self._FOCUS_ACTIONS[cmd]))
+            else:
+                act.setEnabled(False)
+
+    def _toggle_autostart(self):
+        ok = _task_set(not _task_exists())
+        self.notify("开机自启已开启 (计划任务)" if ok and _task_exists()
+                    else ("开机自启已关闭" if ok else "设置失败: 需要管理员权限运行"))
 
     def _popup_menu(self):
-        menu = user32.CreatePopupMenu()
-        user32.AppendMenuW(menu, MF_STRING, ID_SORT, "任务栏排序 (右Alt+;)")
-        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        self._append_slots(menu, ID_SNAP1, "快照 Snapshot (右Alt 长按 ,./)")
-        self._append_slots(menu, ID_RESTORE1, "恢复 Restore (右Alt 短按 ,./)")
-        self._append_slots(menu, ID_CLEAR1, "清空 Clear")
-        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        # EQ 平铺 (无子菜单): 预设项带勾选 + 内联设置摘要 (原生菜单无悬停 tooltip,
-        # 摘要即替代方案)
-        current = self.hub.eq_current()
-        user32.AppendMenuW(menu, MF_STRING, ID_EQ_CYCLE, "循环预设 (右Alt+')")
-        for i, name in enumerate(self.hub.eq_presets()):
-            summary = self.hub.eq_preset_summary(name)
-            label = f"{name}  · {summary}" if summary else name
-            flags = MF_STRING | (MF_CHECKED if name == current else MF_UNCHECKED)
-            user32.AppendMenuW(menu, flags, ID_EQ_PRESET0 + i, label)
-        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if self.hub.eq_auto_enabled() else MF_UNCHECKED),
-                           ID_EQ_AUTO, "自动切换")
-        user32.AppendMenuW(menu, MF_STRING, ID_EQ_EDITOR,
-                           "打开调整面板 (EqualizerAPO Editor)")
-        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        cur_sum = self.hub.eq_preset_summary(current)
-        cur_label = f"当前: {current}  · {cur_sum}" if cur_sum else f"当前: {current}"
-        user32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, cur_label)
-        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-        user32.AppendMenuW(menu, MF_STRING | (MF_CHECKED if _task_exists() else MF_UNCHECKED),
-                           ID_AUTOSTART, "开机自启 (计划任务)")
-        user32.AppendMenuW(menu, MF_STRING, ID_LOG, "打开日志目录")
-        user32.AppendMenuW(menu, MF_STRING, ID_EXIT, "退出")
-        user32.SetForegroundWindow(self._hwnd)
-        pt = wintypes.POINT()
-        user32.GetCursorPos(ctypes.byref(pt))
-        cmd = user32.TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY,
-                                    pt.x, pt.y, 0, self._hwnd, None)
-        user32.PostMessageW(self._hwnd, WM_NULL, 0, 0)
-        user32.DestroyMenu(menu)
-        if cmd:
-            self._dispatch(cmd)
+        # popup() 非模态: 立即返回, 主线程不进嵌套循环。exec() 的模态循环在托盘
+        # 这种无前台窗口场景会因焦点竞争挂死主线程 → watchdog 判"无响应"误杀
+        # (2026-09-19 09:52/09:55 两次重启即此形态)。
+        # ⚠ popup() 后本方法立刻返回, 局部引用一出作用域就被 GC → 菜单刚弹即毁
+        # (用户报"右键不再弹出"), 必须自持引用, aboutToHide 再放。
+        menu = self._build_menu()
+        self._menu_ref = menu
+        menu.aboutToHide.connect(self._menu_dismissed)
+        menu.popup(QCursor.pos())
 
-    def _dispatch(self, cmd):
-        h = self.hub
-        if cmd == ID_SORT:
-            h.sort_now()
-        elif ID_SNAP1 <= cmd < ID_SNAP1 + 3:
-            h.snapshot(cmd - ID_SNAP1 + 1)
-        elif ID_RESTORE1 <= cmd < ID_RESTORE1 + 3:
-            h.restore(cmd - ID_RESTORE1 + 1)
-        elif ID_CLEAR1 <= cmd < ID_CLEAR1 + 3:
-            h.clear(cmd - ID_CLEAR1 + 1)
-        elif cmd == ID_EQ_CYCLE:
-            h.eq_cycle()
-        elif ID_EQ_PRESET0 <= cmd < ID_EQ_PRESET0 + len(h.eq_presets()):
-            h.eq_set_preset(h.eq_presets()[cmd - ID_EQ_PRESET0])
-        elif cmd == ID_EQ_AUTO:
-            h.eq_set_auto(not h.eq_auto_enabled())
-        elif cmd == ID_EQ_EDITOR:
-            h.open_eq_editor()
-        elif cmd == ID_AUTOSTART:
-            ok = _task_set(not _task_exists())
-            self.notify("开机自启已开启 (计划任务)" if ok and _task_exists()
-                        else ("开机自启已关闭" if ok else "设置失败: 需要管理员权限运行"))
-        elif cmd == ID_LOG:
-            h.open_log_dir()
-        elif cmd == ID_EXIT:
-            h.quit()
+    def _menu_dismissed(self):
+        menu = self._menu_ref
+        self._menu_ref = None
+        if menu is not None:
+            menu.deleteLater()

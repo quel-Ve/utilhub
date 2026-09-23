@@ -1,0 +1,12 @@
+{
+    "manifest_version": 3,
+    "name": "Focus Guard (UtilityHub)",
+    "short_name": "FocusGuard",
+    "version": "0.2.0",
+    "description": "UtilityHub 专注拦截: 工作时段 + 每日额度, 拦截分心站点; 工具栏徽章实时显示执法状态",
+    "permissions": ["tabs", "alarms", "storage", "idle", "notifications"],
+    "host_permissions": ["http://127.0.0.1/*"],
+    "background": { "service_worker": "sw.js" },
+    "action": { "default_title": "Focus Guard" },
+    "icons": { "16": "icon16.png", "48": "icon48.png", "128": "icon128.png" }
+}

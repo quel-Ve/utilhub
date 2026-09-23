@@ -46,6 +46,10 @@ if errorlevel 1 (
     echo [ERROR] Failed to register scheduled task.
     exit /b 1
 )
+rem Watchdog 常驻 (2026-08-25): 双进程守护 utilhub + win2blur, 保证托盘图标永远在。
+rem 单实例 Mutex 去重, hub 启动时也会拉起一个 — 二者并存只留其一, 无冲突。
+schtasks /create /tn "UtilityHubWatchdog" /tr "\"%PYTHONW%\" \"%HUBROOT%watchdog.py\"" /sc onlogon /ru %USERNAME% /rl highest /f >nul 2>&1
+schtasks /run /tn "UtilityHubWatchdog" >nul 2>&1
 schtasks /run /tn "%TASK%" >nul 2>&1
 echo [OK] UtilityHub installed and started.
 echo     Hotkeys: Ctrl+Alt+` sort / Ctrl+Alt+1/2/3 snapshot-restore. Uninstall: uninstall.bat
